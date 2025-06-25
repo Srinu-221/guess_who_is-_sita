@@ -1,22 +1,18 @@
 import streamlit as st
-import pyrebase
+import firebase_admin
+from firebase_admin import credentials, firestore
 import random
-import time
+import json
 
-# Firebase config
-firebaseConfig = {
-    "apiKey": "YOUR_API_KEY",
-    "authDomain": "YOUR_DOMAIN",
-    "databaseURL": "YOUR_DB_URL",
-    "projectId": "YOUR_PROJECT_ID",
-    "storageBucket": "YOUR_BUCKET",
-    "messagingSenderId": "YOUR_SENDER_ID",
-    "appId": "YOUR_APP_ID"
-}
+# 🔐 Initialize Firebase from secrets (for Streamlit Cloud)
+firebase_json = json.loads(st.secrets["firebase_json"])
+cred = credentials.Certificate(firebase_json)
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred)
 
-firebase = pyrebase.initialize_app(firebaseConfig)
-db = firebase.database()
+db = firestore.client()
 
+# Character roles and points
 CHARACTERS = [
     ("Rama", 1000),
     ("Sita", 0),
@@ -28,63 +24,71 @@ CHARACTERS = [
 
 st.title("🎭 Guess Who is Sita - Multiplayer Game")
 
-# Join
-player = st.text_input("Enter your name to join:")
-if player:
-    if not db.child("players").child(player).get().val():
-        db.child("players").child(player).set({"character": None, "score": 0})
-        st.success(f"{player} joined the game!")
+# Player joins
+name = st.text_input("Enter your name to join:")
+if name:
+    doc = db.collection("players").document(name).get()
+    if not doc.exists:
+        db.collection("players").document(name).set({
+            "character": None,
+            "score": 0
+        })
+        st.success(f"{name} joined!")
 
-# Show current players
-players_data = db.child("players").get().val() or {}
-st.write("### 👥 Current Players")
-st.write(list(players_data.keys()))
+# Show list of players
+players = list(db.collection("players").stream())
+player_names = [p.id for p in players]
+st.write("### 👥 Players Joined:", player_names)
 
-# Assign roles
-if st.button("🎲 Start Round") and len(players_data) >= 4:
-    roles = CHARACTERS[:len(players_data)]
+# Assign characters
+if st.button("🎲 Assign Characters") and len(player_names) >= 4:
+    roles = CHARACTERS[:len(player_names)]
     random.shuffle(roles)
-    for name, role in zip(players_data.keys(), roles):
-        db.child("players").child(name).update({"character": role[0]})
-    db.child("game_state").set({"assigned": True})
-    st.success("Characters assigned!")
+    for player, role in zip(player_names, roles):
+        db.collection("players").document(player).update({"character": role[0]})
+    db.collection("game_state").document("round").set({"active": True})
+    st.success("✅ Characters assigned! Rama can now guess who Sita is.")
 
 # Show your role
-if player and player in players_data:
-    my_data = db.child("players").child(player).get().val()
-    if my_data.get("character"):
-        st.write(f"🕵️ Your role: **{my_data['character']}**")
+if name in player_names:
+    my_doc = db.collection("players").document(name).get()
+    my_data = my_doc.to_dict()
+    if my_data and my_data.get("character"):
+        st.write(f"🕵️ Your character is: **{my_data['character']}**")
 
-# Rama guesses
-game_state = db.child("game_state").get().val()
-if game_state and game_state.get("assigned"):
-    player_roles = {name: db.child("players").child(name).get().val()['character']
-                    for name in players_data}
+# Rama guesses Sita
+player_roles = {
+    p.id: db.collection("players").document(p.id).get().to_dict().get("character")
+    for p in players
+}
+rama = next((p for p, c in player_roles.items() if c == "Rama"), None)
+sita = next((p for p, c in player_roles.items() if c == "Sita"), None)
 
-    rama = next((k for k, v in player_roles.items() if v == "Rama"), None)
-    sita = next((k for k, v in player_roles.items() if v == "Sita"), None)
-
-    if player == rama:
-        guess = st.selectbox("Who is Sita?", [p for p in players_data if p != player])
-        if st.button("🔍 Submit Guess"):
-            if guess == sita:
-                st.success("🎉 Correct!")
-                curr = db.child("players").child(rama).child("score").get().val()
-                db.child("players").child(rama).update({"score": curr + 1000})
-            else:
-                st.error(f"❌ Wrong! It was {sita}")
-                curr = db.child("players").child(sita).child("score").get().val()
-                db.child("players").child(sita).update({"score": curr + 1000})
-            db.child("game_state").remove()
+if name == rama and rama and sita:
+    guess = st.selectbox("🧐 Who do you think is Sita?", [p for p in player_names if p != name])
+    if st.button("🔍 Submit Guess"):
+        if guess == sita:
+            st.success("🎉 Correct guess! Rama gets 1000 points.")
+            db.collection("players").document(rama).update({
+                "score": firestore.Increment(1000)
+            })
+        else:
+            st.error(f"❌ Wrong! {sita} was Sita. Sita gets 1000 points.")
+            db.collection("players").document(sita).update({
+                "score": firestore.Increment(1000)
+            })
+        # End the round
+        db.collection("game_state").document("round").delete()
 
 # Show scores
 st.write("### 🧾 Scores")
-scores = {k: v["score"] for k, v in players_data.items()}
-for name, score in scores.items():
-    st.write(f"{name}: {score} pts")
+for p in db.collection("players").stream():
+    d = p.to_dict()
+    st.write(f"**{p.id}**: {d.get('score', 0)} points")
 
 # Reset game
-if st.button("🔄 Reset"):
-    db.child("players").remove()
-    db.child("game_state").remove()
-    st.success("Game reset!")
+if st.button("🔄 Reset Game"):
+    for p in db.collection("players").stream():
+        db.collection("players").document(p.id).delete()
+    db.collection("game_state").document("round").delete()
+    st.success("Game reset. All data cleared.")
